@@ -12,6 +12,8 @@ Debugging a multi-step agent in production is hard. When a tool call 20 steps in
 
 Instead of wrapping each SDK individually (the OpenLLMetry approach), `agent-trace` intercepts at the **`httpx` transport layer** — the HTTP client used by the OpenAI, Anthropic, and most other Python SDKs. One monkey-patch catches all providers. `contextvars.ContextVar` propagates the current span context through `asyncio` call chains so every auto-detected LLM call is parented to the right reasoning step automatically.
 
+Streaming responses (SSE) are fully supported — the interceptor wraps the byte stream, accumulates chunks, and emits the span with token counts and completion text only after the stream closes.
+
 ```
 agent ReActAgent
   ├── step think          ← gen_ai.operation.name=agent_step
@@ -48,6 +50,9 @@ cp sample.env .env   # add your API key(s)
 python examples/react_agent.py      # Anthropic
 python examples/openai_agent.py     # OpenAI
 python examples/groq_agent.py       # Groq (free tier)
+python examples/streaming_model.py --provider anthropic  # streaming, no wrappers needed
+python examples/langchain_react_agent.py   # LangChain adapter
+python examples/langgraph_react_agent.py   # LangGraph adapter
 ```
 
 Open [http://localhost:16686](http://localhost:16686) and select the service (e.g. `groq-agent-demo`).
@@ -63,6 +68,60 @@ AGENT_TRACE_OTLP_ENDPOINT=http://<tempo-host>:4318/v1/traces
 ```
 
 The trace structure is identical across all providers. The tracer has no idea which SDK was used.
+
+## Framework integrations (optional)
+
+The core tracer remains framework-agnostic. If you use LangChain or LangGraph, you can opt into adapters that map framework lifecycle events to `agent` / `step` / `tool` spans while the interceptor continues to own LLM `chat` spans.
+
+Install extras:
+
+```bash
+pip install -e ".[langchain]"
+pip install -e ".[langgraph]"
+```
+
+### LangChain
+
+`trace_runnable` wraps any LangChain `Runnable` and injects `AgentTraceCallbackHandler` automatically:
+
+```python
+from agent_trace.adapters.langchain import trace_runnable, AgentTraceCallbackHandler
+
+traced = trace_runnable(my_runnable, agent_name="MyAgent")
+result = traced.invoke({"question": "..."})        # sync
+result = await traced.ainvoke({"question": "..."}) # async
+```
+
+Use `AgentTraceCallbackHandler` directly when you need more control:
+
+```python
+handler = AgentTraceCallbackHandler(
+    agent_name="MyAgent",
+    step_on_agent_action=True,   # emit a step span on each AgentAction
+    record_tool_output=False,    # set True to attach tool output to span
+)
+chain.invoke(input, config={"callbacks": [handler]})
+```
+
+### LangGraph
+
+`trace_graph` is a sync/async context manager for the outer agent span. `graph_config` injects the callback handler into the graph's run config:
+
+```python
+from agent_trace.adapters.langgraph import trace_graph, graph_config
+
+with trace_graph("MyGraph"):
+    result = app.invoke(state, config=graph_config(agent_name="MyGraph"))
+
+# async variant
+async with trace_graph("MyGraph"):
+    result = await app.ainvoke(state, config=graph_config(agent_name="MyGraph"))
+```
+
+Read the full integration guides:
+
+- [LangChain integration](docs/integrations/langchain.md)
+- [LangGraph integration](docs/integrations/langgraph.md)
 
 ## API
 
@@ -84,6 +143,13 @@ async with agent_trace.agent("MyAgent"):
 
     async with agent_trace.tool("search_web", input=query):
         result = await web_search(query)
+```
+
+To remove the httpx monkey-patch (e.g. in tests):
+
+```python
+from agent_trace import interceptor
+interceptor.uninstall()
 ```
 
 ## Span attributes (GenAI semantic conventions)
@@ -124,6 +190,7 @@ Any SDK that uses `httpx` under the hood is automatically instrumented. Tested p
 | Anthropic | `anthropic` | `claude-haiku-4-5-20251001` |
 | OpenAI | `openai` | `gpt-4o-mini` |
 | Groq | `groq` | `llama-3.1-8b-instant` |
+| Google Gemini | `google-generativeai` | `gemini-1.5-flash` |
 | Ollama | direct HTTP | `llama3` |
 
 Other providers with OpenAI-compatible APIs (Together AI, Mistral, Cohere) are detected automatically — no code changes needed.

@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+langchain = [
+    "langchain-core>=0.2.0",
+]
+langgraph = [
+    "langgraph>=0.2.0",
+    "langchain-core>=0.2.0",
+]
 dev = [
     "anthropic>=0.26.0",
     "openai>=1.30.0",
@@ -31,6 +38,8 @@ dev = [
     "python-dotenv>=1.0.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "langchain-core>=0.2.0",
+    "langgraph>=0.2.0",
 ]
 
 [tool.setuptools.packages.find]

@@ -13,17 +13,12 @@ Usage:
 """
 from __future__ import annotations
 
-import asyncio
 import os
-from contextlib import asynccontextmanager, contextmanager
-from contextvars import copy_context
-from typing import Any, AsyncGenerator, Generator, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator
 
-from opentelemetry.trace import StatusCode, use_span
-
-from .context import TraceContext, _current, get_context
+from ._runtime import enter_agent, enter_step, enter_tool, exit_frame
 from .exporter import configure
-from .spans import agent_attrs, llm_request_attrs, start_span, step_attrs, tool_attrs
 
 # Activating the interceptor is a side-effect of importing it.
 from . import interceptor as _interceptor  # noqa: F401
@@ -60,46 +55,40 @@ def init(
 @asynccontextmanager
 async def agent(name: str) -> AsyncGenerator[None, None]:
     """Top-level span for a complete agent run."""
-    span = start_span(f"agent {name}", attributes=agent_attrs(name))
-    ctx = TraceContext(span=span)
-    token = _current.set(ctx)
-    with use_span(span, end_on_exit=True, record_exception=True):
-        try:
-            yield
-        finally:
-            _current.reset(token)
+    frame = enter_agent(name)
+    try:
+        yield
+    except Exception as exc:
+        exit_frame(frame, type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        exit_frame(frame)
 
 
 @asynccontextmanager
 async def step(name: str) -> AsyncGenerator[None, None]:
     """A reasoning step within an agent run. Automatically tracks retry attempts."""
-    ctx = get_context()
-    retry_attempt = 0
-    if ctx is not None:
-        count = ctx.step_counts.get(name, 0)
-        ctx.step_counts[name] = count + 1
-        retry_attempt = count  # 0 = first attempt, 1+ = retries
-
-    span = start_span(f"step {name}", attributes=step_attrs(name, retry_attempt))
-    token = _current.set(TraceContext(span=span, step_counts=ctx.step_counts if ctx else {}))
-    with use_span(span, end_on_exit=True, record_exception=True):
-        try:
-            yield
-        finally:
-            _current.reset(token)
+    frame = enter_step(name)
+    try:
+        yield
+    except Exception as exc:
+        exit_frame(frame, type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        exit_frame(frame)
 
 
 @asynccontextmanager
 async def tool(name: str, input: Any = None) -> AsyncGenerator[None, None]:
     """A tool call within a step."""
-    span = start_span(f"tool {name}", attributes=tool_attrs(name, input))
-    ctx = get_context()
-    token = _current.set(TraceContext(span=span, step_counts=ctx.step_counts if ctx else {}))
-    with use_span(span, end_on_exit=True, record_exception=True):
-        try:
-            yield
-        finally:
-            _current.reset(token)
+    frame = enter_tool(name, input_value=input)
+    try:
+        yield
+    except Exception as exc:
+        exit_frame(frame, type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        exit_frame(frame)
 
 
 # Expose for convenience

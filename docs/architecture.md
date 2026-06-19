@@ -143,8 +143,10 @@ All attributes follow the [OpenTelemetry GenAI semantic conventions](https://ope
 ```
 agent_trace/
   __init__.py       Public API — init(), agent(), step(), tool()
+  _runtime.py       Shared span lifecycle helpers (used by API and adapters)
   context.py        ContextVar[TraceContext] — ambient span carrier
   interceptor.py    httpx monkey-patch — LLM auto-detection and span creation
   spans.py          OTel span factory + GenAI semconv attribute builders
   exporter.py       TracerProvider setup — OTLP or console
+  adapters/         Optional framework adapters (LangChain, LangGraph)
 ```
