@@ -22,10 +22,21 @@ pytest -v
 
 ```
 tests/
-  test_interceptor.py   httpx monkey-patch: LLM calls are traced, non-LLM calls pass through
-  test_context.py       ContextVar propagation across asyncio tasks
-  test_spans.py         GenAI semconv attribute builders
-  test_api.py           Public API: agent/step/tool context managers, retry detection
+  test_interceptor.py           httpx monkey-patch: LLM calls traced (OpenAI, Anthropic, Gemini,
+                                 Ollama native, Azure, OpenRouter, AGENT_TRACE_EXTRA_HOSTS),
+                                 non-LLM calls pass through, streaming SSE parsing
+  test_context.py               ContextVar propagation across asyncio tasks
+  test_spans.py                 GenAI semconv attribute builders
+  test_api.py                   Public API: agent/step/tool context managers, retry detection
+  test_runtime_hardening.py     Explicit span parenting, OTel-current-span fallback,
+                                 tolerant exit_frame across contextvars contexts
+  test_threading.py             agent_trace.bind_context for ThreadPoolExecutor/run_in_executor
+  test_summary.py               RunSummaryProcessor aggregation + JSON/markdown file output
+  adapters/
+    test_stack.py                Run-id keyed span-frame stack (RunStack)
+    test_langchain_handler.py    AgentTraceCallbackHandler span hierarchy
+    test_langgraph.py            trace_graph()/graph_config() basics
+    test_realworld_execution.py  Real langgraph graphs: sync/async/combined/concurrent execution
 ```
 
 ---

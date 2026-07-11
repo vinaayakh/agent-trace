@@ -72,17 +72,26 @@ When you do `async with agent_trace.step("plan"):`, the library:
 4. Saves a reset token so the previous value is restored on exit
 
 ```python
-# __init__.py (simplified)
-@asynccontextmanager
-async def step(name):
-    span = start_span(f"step {name}", attributes=step_attrs(name), ...)
+# _runtime.py (simplified)
+def enter_step(name, parent=None):
+    span = start_span(f"step {name}", attributes=step_attrs(name), parent=parent)
     token = _current.set(TraceContext(span=span, ...))
-    with use_span(span, end_on_exit=True):
-        yield
-    _current.reset(token)          # restores parent context
+    return SpanFrame(token=token, span=span)
+
+def exit_frame(frame, exc_type=None, exc_value=None, exc_tb=None):
+    if exc_value is not None:
+        frame.span.record_exception(exc_value)
+        frame.span.set_status(StatusCode.ERROR, str(exc_value))
+    frame.span.end()
+    try:
+        _current.reset(frame.token)   # restores parent context
+    except ValueError:
+        pass   # set/reset happened in different contextvars contexts — tolerated
 ```
 
-When the interceptor fires, it calls `current_otel_context()`, which reads `_current` and returns the current span as an OTel parent context. The auto-detected LLM span is therefore automatically nested under whatever `agent/step/tool` block is active.
+When the interceptor fires, it calls `current_otel_context()`, which reads `_current` and returns the current span as an OTel parent context. The auto-detected LLM span is therefore automatically nested under whatever `agent/step/tool` block is active. Callers can also pass an explicit `parent=` span (used by the LangChain/LangGraph adapters, which resolve parents from a callback run-id stack) — this wins over the ambient `_current` value and is the defense-in-depth path for frameworks that dispatch step callbacks on a different `asyncio` Task than the one that started them.
+
+`enter_*`/`exit_frame` deliberately manage span lifecycle directly (`span.end()`, not OTel's `use_span()` context-manager helper) — `use_span` attaches/detaches its own token in OTel's *ambient* Context, which has the same cross-task fragility as our own `_current` ContextVar, and since we already thread parenting explicitly we don't need it. If our own `_current` is empty and no explicit parent was given, `start_span` falls back to OTel's ambient current span (`trace.get_current_span()`) when it's recording, so agent-trace spans still nest under other instrumentation libraries that do use `use_span`.
 
 ---
 
@@ -142,11 +151,12 @@ All attributes follow the [OpenTelemetry GenAI semantic conventions](https://ope
 
 ```
 agent_trace/
-  __init__.py       Public API — init(), agent(), step(), tool()
+  __init__.py       Public API — init(), agent(), step(), tool(), bind_context(), get_summary()
   _runtime.py       Shared span lifecycle helpers (used by API and adapters)
   context.py        ContextVar[TraceContext] — ambient span carrier
   interceptor.py    httpx monkey-patch — LLM auto-detection and span creation
   spans.py          OTel span factory + GenAI semconv attribute builders
-  exporter.py       TracerProvider setup — OTLP or console
+  exporter.py       TracerProvider setup (OTLP or console) + summary processor wiring
+  summary.py        RunSummaryProcessor — per-run aggregate (tokens, calls, errors) to JSON/markdown
   adapters/         Optional framework adapters (LangChain, LangGraph)
 ```

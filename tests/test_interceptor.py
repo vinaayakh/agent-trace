@@ -34,6 +34,22 @@ def _openai_response(model="gpt-4o-mini", prompt_tokens=50, completion_tokens=20
     }
 
 
+def _gemini_response(prompt_tokens=50, candidates_tokens=20):
+    return {
+        "candidates": [
+            {
+                "content": {"parts": [{"text": "The answer is 42."}], "role": "model"},
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": prompt_tokens,
+            "candidatesTokenCount": candidates_tokens,
+            "totalTokenCount": prompt_tokens + candidates_tokens,
+        },
+    }
+
+
 def _make_client(response_body: dict, base_url: str) -> httpx.Client:
     """Sync httpx client backed by a mock transport."""
     def handler(request: httpx.Request) -> httpx.Response:
@@ -92,6 +108,29 @@ def test_sync_openai_call_creates_span(span_exporter):
     assert span_attr(span_exporter, spans[0].name, "gen_ai.system") == "openai"
 
 
+def test_sync_gemini_call_creates_span(span_exporter):
+    client = _make_client(_gemini_response(), "https://generativelanguage.googleapis.com")
+    body = json.dumps({"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]})
+    client.post("/v1beta/models/gemini-1.5-flash:generateContent", content=body.encode())
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert "google" in spans[0].name
+    assert span_attr(span_exporter, spans[0].name, "gen_ai.system") == "google"
+
+
+def test_sync_gemini_span_has_token_attrs(span_exporter):
+    client = _make_client(_gemini_response(prompt_tokens=75, candidates_tokens=30), "https://generativelanguage.googleapis.com")
+    body = json.dumps({"contents": [{"role": "user", "parts": [{"text": "Hi"}]}]})
+    client.post("/v1beta/models/gemini-1.5-flash:generateContent", content=body.encode())
+
+    spans = span_exporter.get_finished_spans()
+    assert span_attr(span_exporter, spans[0].name, "gen_ai.usage.input_tokens") == 75
+    assert span_attr(span_exporter, spans[0].name, "gen_ai.usage.output_tokens") == 30
+    assert span_attr(span_exporter, spans[0].name, "gen_ai.response.finish_reasons") == "STOP"
+    assert span_attr(span_exporter, spans[0].name, "gen_ai.completion_preview") == "The answer is 42."
+
+
 def test_non_llm_call_not_intercepted(span_exporter):
     def handler(request):
         return httpx.Response(200, json={"ok": True})
@@ -114,11 +153,39 @@ def test_non_llm_call_not_intercepted(span_exporter):
         ("https://evil-api.openai.com.attacker.net/v1/chat/completions", False),
         ("https://api.openai.com/proxy/v1/chat/completions", False),
         ("https://example.com/health", False),
+        # Ollama native paths
+        ("https://localhost:11434/api/chat", True),
+        ("https://127.0.0.1:11434/api/generate", True),
+        ("https://localhost:11434/api/tags", False),
+        # Azure OpenAI
+        ("https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01", True),
+        ("https://my-resource.openai.azure.com/openai/deployments/gpt-4o/embeddings", False),
+        ("https://notazure.com/openai/deployments/gpt-4o/chat/completions", False),
+        # OpenRouter
+        ("https://openrouter.ai/api/v1/chat/completions", True),
+        ("https://evil-openrouter.ai.attacker.net/v1/chat/completions", False),
     ],
 )
 def test_is_llm_request_matching_rules(url: str, expected: bool):
     request = httpx.Request("POST", url)
     assert _is_llm_request(request) is expected
+
+
+def test_is_llm_request_extra_hosts_env_var(monkeypatch):
+    monkeypatch.setenv("AGENT_TRACE_EXTRA_HOSTS", "my-custom-proxy.internal, other-proxy.example")
+
+    matching = httpx.Request("POST", "https://my-custom-proxy.internal/v1/chat/completions")
+    other = httpx.Request("POST", "https://other-proxy.example/v1/messages")
+    unrelated = httpx.Request("POST", "https://not-configured.example/v1/chat/completions")
+
+    assert _is_llm_request(matching) is True
+    assert _is_llm_request(other) is True
+    assert _is_llm_request(unrelated) is False
+
+
+def test_is_llm_request_extra_hosts_env_var_unset_by_default():
+    request = httpx.Request("POST", "https://my-custom-proxy.internal/v1/chat/completions")
+    assert _is_llm_request(request) is False
 
 
 # ── Async interception ────────────────────────────────────────────────────────
@@ -197,6 +264,15 @@ def _anthropic_sse_bytes() -> bytes:
     return b"".join(chunks)
 
 
+def _gemini_sse_bytes() -> bytes:
+    chunks = [
+        b'data: {"candidates":[{"content":{"parts":[{"text":"Hello "}],"role":"model"}}]}\n\n',
+        b'data: {"candidates":[{"content":{"parts":[{"text":"world"}],"role":"model"},"finishReason":"STOP"}],'
+        b'"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}\n\n',
+    ]
+    return b"".join(chunks)
+
+
 class _FakeSyncSseStream(httpx.SyncByteStream):
     def __init__(self, data: bytes) -> None:
         self._data = data
@@ -265,6 +341,35 @@ def test_parse_sse_chunks_anthropic():
     assert out_tok == 5
     assert finish == "end_turn"
     assert preview == "Hello world"
+
+
+def test_parse_sse_chunks_gemini():
+    in_tok, out_tok, finish, preview = _parse_sse_chunks(_gemini_sse_bytes(), "google")
+    assert in_tok == 10
+    assert out_tok == 5
+    assert finish == "STOP"
+    assert preview == "Hello world"
+
+
+def test_sync_gemini_streaming_span_has_token_attrs(span_exporter):
+    client = _make_streaming_client(_gemini_sse_bytes(), "https://generativelanguage.googleapis.com")
+    request = httpx.Request(
+        "POST",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent",
+        content=json.dumps({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).encode(),
+    )
+    response = client.send(request, stream=True)
+    assert len(span_exporter.get_finished_spans()) == 0, "span must not end at send()"
+
+    list(response.iter_lines())
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    attrs = spans[0].attributes
+    assert attrs.get("gen_ai.usage.input_tokens") == 10
+    assert attrs.get("gen_ai.usage.output_tokens") == 5
+    assert attrs.get("gen_ai.response.finish_reasons") == "STOP"
+    assert attrs.get("gen_ai.completion_preview") == "Hello world"
 
 
 def test_sync_streaming_span_ends_after_stream_not_at_send(span_exporter):

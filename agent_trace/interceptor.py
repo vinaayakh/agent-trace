@@ -9,13 +9,12 @@ Activation: importing this module (or calling install()) is all that's needed.
 from __future__ import annotations
 
 import json
-import time
+import os
 from typing import Any, AsyncIterator, Iterator, Optional
 
 import httpx
 from opentelemetry.trace import StatusCode
 
-from .context import get_context, set_context, TraceContext
 from .spans import (
     start_span,
     llm_request_attrs,
@@ -31,6 +30,8 @@ _LLM_HOSTS: set[str] = {
     "api.mistral.ai",
     "api.together.xyz",
     "api.groq.com",
+    "openrouter.ai",
+    "openai.azure.com",  # suffix-matches <resource>.openai.azure.com
     "localhost",        # Ollama and local proxies
     "127.0.0.1",
 }
@@ -41,10 +42,30 @@ _LLM_PATHS: tuple[str, ...] = (
     "/v1/chat/completions",  # OpenAI, Groq, Together, Ollama
     "/v1/completions",
     "/v1beta/models",        # Gemini
-    "/v1/generate",          # Ollama
+    "/v1/generate",          # Ollama (legacy)
+    "/api/chat",             # Ollama native
+    "/api/generate",         # Ollama native
+    "/api/v1/chat/completions",  # OpenRouter
+    "/api/v1/completions",       # OpenRouter
 )
 
 _installed = False
+
+
+def _configured_hosts() -> set[str]:
+    """`_LLM_HOSTS` plus any hosts from AGENT_TRACE_EXTRA_HOSTS (comma-separated).
+
+    Read fresh on every call (not cached) so custom base URLs/proxies can be
+    opted into tracing via env var without a code change or re-import.
+    """
+    extra = os.environ.get("AGENT_TRACE_EXTRA_HOSTS", "")
+    extra_hosts = {h.strip() for h in extra.split(",") if h.strip()}
+    return _LLM_HOSTS | extra_hosts
+
+
+def _is_azure_chat_path(path: str) -> bool:
+    """Azure OpenAI: /openai/deployments/<deployment>/chat/completions"""
+    return "/openai/deployments/" in path and path.rstrip("/").endswith("/chat/completions")
 
 
 def _host_matches(host: str, allowed: str) -> bool:
@@ -93,6 +114,21 @@ def _parse_sse_chunks(
                         usage = obj.get("usage", {})
                         output_tokens = usage.get("output_tokens")
                         finish_reason = obj.get("delta", {}).get("stop_reason")
+                elif provider == "google":
+                    usage_metadata = obj.get("usageMetadata")
+                    if usage_metadata:
+                        input_tokens = usage_metadata.get("promptTokenCount")
+                        output_tokens = usage_metadata.get("candidatesTokenCount")
+                    candidates = obj.get("candidates") or []
+                    if candidates:
+                        candidate = candidates[0]
+                        parts = candidate.get("content", {}).get("parts", [])
+                        for part in parts:
+                            if isinstance(part, dict) and part.get("text"):
+                                content_parts.append(part["text"])
+                        fr = candidate.get("finishReason")
+                        if fr:
+                            finish_reason = fr
                 else:
                     usage = obj.get("usage") or {}
                     if usage:
@@ -186,10 +222,9 @@ class _AsyncSseWrapper(httpx.AsyncByteStream):
 def _is_llm_request(request: httpx.Request) -> bool:
     host = request.url.host or ""
     path = request.url.path
-    return (
-        any(_host_matches(host, allowed) for allowed in _LLM_HOSTS)
-        and any(path.startswith(p) for p in _LLM_PATHS)
-    )
+    if not any(_host_matches(host, allowed) for allowed in _configured_hosts()):
+        return False
+    return any(path.startswith(p) for p in _LLM_PATHS) or _is_azure_chat_path(path)
 
 
 def _detect_provider(request: httpx.Request) -> str:
@@ -208,6 +243,10 @@ def _detect_provider(request: httpx.Request) -> str:
         return "groq"
     if _host_matches(host, "api.together.xyz"):
         return "together"
+    if _host_matches(host, "openrouter.ai"):
+        return "openrouter"
+    if _host_matches(host, "openai.azure.com"):
+        return "azure"
     if host in {"localhost", "127.0.0.1"}:
         return "ollama"
     return "unknown"
@@ -260,6 +299,24 @@ def _parse_response(response: httpx.Response) -> tuple[Optional[int], Optional[i
             content = body.get("content", [])
             if isinstance(content, list) and content:
                 completion_preview = content[0].get("text", "")
+
+        # Gemini-style
+        usage_metadata = body.get("usageMetadata")
+        if usage_metadata:
+            if input_tokens is None:
+                input_tokens = usage_metadata.get("promptTokenCount")
+            if output_tokens is None:
+                output_tokens = usage_metadata.get("candidatesTokenCount")
+        candidates = body.get("candidates")
+        if candidates and isinstance(candidates, list):
+            candidate = candidates[0]
+            if not finish_reason:
+                finish_reason = candidate.get("finishReason")
+            if not completion_preview:
+                parts = candidate.get("content", {}).get("parts", [])
+                completion_preview = "".join(
+                    p.get("text", "") for p in parts if isinstance(p, dict)
+                )
     except Exception:
         pass
     return input_tokens, output_tokens, finish_reason, completion_preview

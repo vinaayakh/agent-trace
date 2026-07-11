@@ -29,9 +29,17 @@ def start_span(
     name: str,
     kind: SpanKind = SpanKind.INTERNAL,
     attributes: Optional[dict[str, Any]] = None,
+    parent: Optional[Span] = None,
 ) -> Span:
     tracer = get_tracer()
-    parent_ctx = current_otel_context()
+    if parent is not None:
+        parent_ctx = trace.set_span_in_context(parent)
+    else:
+        parent_ctx = current_otel_context()
+        if parent_ctx is None:
+            current_span = trace.get_current_span()
+            if current_span is not None and current_span.is_recording():
+                parent_ctx = trace.set_span_in_context(current_span)
     kwargs: dict[str, Any] = {"kind": kind}
     if attributes:
         kwargs["attributes"] = attributes

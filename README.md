@@ -12,7 +12,7 @@ Debugging a multi-step agent in production is hard. When a tool call 20 steps in
 
 Instead of wrapping each SDK individually (the OpenLLMetry approach), `agent-trace` intercepts at the **`httpx` transport layer** — the HTTP client used by the OpenAI, Anthropic, and most other Python SDKs. One monkey-patch catches all providers. `contextvars.ContextVar` propagates the current span context through `asyncio` call chains so every auto-detected LLM call is parented to the right reasoning step automatically.
 
-Streaming responses (SSE) are fully supported — the interceptor wraps the byte stream, accumulates chunks, and emits the span with token counts and completion text only after the stream closes.
+Streaming responses (SSE) are fully supported — the interceptor wraps the byte stream, accumulates chunks, and emits the span with token counts and completion text only after the stream closes. **Note:** OpenAI only includes usage (`gen_ai.usage.*`) in a streamed response if the caller sets `stream_options={"include_usage": True}` on the request — that's an OpenAI API behavior, not a limitation of the interceptor; without it, the token counts simply aren't in the stream to parse.
 
 ```
 agent ReActAgent
@@ -105,17 +105,22 @@ chain.invoke(input, config={"callbacks": [handler]})
 
 ### LangGraph
 
-`trace_graph` is a sync/async context manager for the outer agent span. `graph_config` injects the callback handler into the graph's run config:
+`graph_config` injects the callback handler into the graph's run config — this alone is the recommended usage, no wrapper needed:
+
+```python
+from agent_trace.adapters.langgraph import graph_config
+
+result = app.invoke(state, config=graph_config(agent_name="MyGraph"))
+result = await app.ainvoke(state, config=graph_config(agent_name="MyGraph"))  # async, same hierarchy
+```
+
+`trace_graph` is an optional sync/async context manager for grouping several `invoke`/`ainvoke` calls under one shared agent span:
 
 ```python
 from agent_trace.adapters.langgraph import trace_graph, graph_config
 
 with trace_graph("MyGraph"):
     result = app.invoke(state, config=graph_config(agent_name="MyGraph"))
-
-# async variant
-async with trace_graph("MyGraph"):
-    result = await app.ainvoke(state, config=graph_config(agent_name="MyGraph"))
 ```
 
 Read the full integration guides:
@@ -151,6 +156,52 @@ To remove the httpx monkey-patch (e.g. in tests):
 from agent_trace import interceptor
 interceptor.uninstall()
 ```
+
+Custom base URLs, proxies, or self-hosted gateways can opt into tracing without a code change via `AGENT_TRACE_EXTRA_HOSTS` (comma-separated hostnames, merged into the built-in host list on every request check):
+
+```bash
+export AGENT_TRACE_EXTRA_HOSTS="my-llm-gateway.internal,another-proxy.example.com"
+```
+
+## Summary exporter
+
+Spans are great for deep inspection in Jaeger/Tempo, but sometimes you just want a results file. Attach `RunSummaryProcessor` via `init(summary=...)` to get a per-run aggregate (agent name, wall duration, LLM call count, total input/output tokens, models used, tool call count, error count, per-step retry counts) alongside the normal span export:
+
+```python
+import agent_trace
+
+agent_trace.init(exporter="console", summary="bench/summary.json")  # or summary=True for in-memory only
+
+async with agent_trace.agent("MyAgent"):
+    ...
+
+# Query in-process at any time:
+print(agent_trace.get_summary())
+# [{"agent_name": "MyAgent", "duration_seconds": 1.42, "llm_call_count": 3,
+#   "input_tokens": 512, "output_tokens": 128, "models": ["gpt-4o-mini"],
+#   "tool_call_count": 1, "error_count": 0, "retry_counts": {}}]
+```
+
+`summary="bench/summary.json"` also writes the JSON above to disk when the provider shuts down (the existing `atexit`-registered `TracerProvider.shutdown()` path — no extra wiring needed). Pass a `.md` path instead (e.g. `summary="bench/summary.md"`) to additionally get a human-readable markdown table as a sibling file, alongside a `.json` with the same basename.
+
+## Threads and executors
+
+`agent_trace` tracks the active span with a `contextvars.ContextVar`, which propagates automatically across `asyncio` `await` boundaries but **not** across real OS threads — work submitted to a `ThreadPoolExecutor` or dispatched via `loop.run_in_executor` starts with no ambient context, so an LLM call made there becomes an orphaned root trace instead of nesting under the step/tool that submitted it.
+
+Wrap the callable with `agent_trace.bind_context` at submission time to fix this — it captures the calling context and replays it inside the thread:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import agent_trace
+
+async with agent_trace.agent("MyAgent"):
+    async with agent_trace.step("plan"):
+        with ThreadPoolExecutor() as pool:
+            future = pool.submit(agent_trace.bind_context(call_llm), prompt)
+            result = await asyncio.wrap_future(future)
+```
+
+This is a best-effort helper for code you control at the submission point — it can't retroactively fix a raw `threading.Thread` target that was already created elsewhere. As a secondary fallback, `agent_trace` spans also nest under any *other* library's OTel span that's current in ambient OTel context (e.g. if that library propagates across threads itself), so tracing degrades gracefully rather than crashing when full propagation isn't possible.
 
 ## Span attributes (GenAI semantic conventions)
 
@@ -191,9 +242,11 @@ Any SDK that uses `httpx` under the hood is automatically instrumented. Tested p
 | OpenAI | `openai` | `gpt-4o-mini` |
 | Groq | `groq` | `llama-3.1-8b-instant` |
 | Google Gemini | `google-generativeai` | `gemini-1.5-flash` |
-| Ollama | direct HTTP | `llama3` |
+| Ollama | direct HTTP (`/api/chat`, `/api/generate`, and the OpenAI-compatible `/v1/chat/completions`) | `llama3` |
+| OpenRouter | direct HTTP / OpenAI-compatible SDKs | any OpenRouter-hosted model |
+| Azure OpenAI | `openai` (Azure config) | your deployment name |
 
-Other providers with OpenAI-compatible APIs (Together AI, Mistral, Cohere) are detected automatically — no code changes needed.
+Other providers with OpenAI-compatible APIs (Together AI, Mistral, Cohere) are detected automatically — no code changes needed. Anything else reachable at a custom host can be added via `AGENT_TRACE_EXTRA_HOSTS` (see [API](#api)).
 
 ## Requirements
 

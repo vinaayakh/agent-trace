@@ -1,4 +1,9 @@
-"""Minimal LangGraph integration using trace_graph + graph_config.
+"""Minimal LangGraph integration using graph_config.
+
+graph_config() alone is the recommended usage: it attaches a callback handler
+that opens the agent span itself on the first (parent_run_id=None) callback,
+so no separate trace_graph() wrapper is needed. trace_graph() remains
+available for grouping multiple invokes under one shared agent span.
 
 Run:
     pip install -e ".[langgraph]"
@@ -11,7 +16,7 @@ from typing import TypedDict
 from langgraph.graph import END, StateGraph
 
 import agent_trace
-from agent_trace.adapters.langgraph import graph_config, trace_graph
+from agent_trace.adapters.langgraph import graph_config
 
 
 class GraphState(TypedDict):
@@ -33,11 +38,10 @@ def main() -> None:
     graph.add_edge("think", END)
     app = graph.compile()
 
-    with trace_graph("LangGraphAgent"):
-        result = app.invoke(
-            {"question": "How does the graph adapter work?", "answer": ""},
-            config=graph_config(agent_name="LangGraphAgent"),
-        )
+    result = app.invoke(
+        {"question": "How does the graph adapter work?", "answer": ""},
+        config=graph_config(agent_name="LangGraphAgent"),
+    )
 
     print(result["answer"])
 

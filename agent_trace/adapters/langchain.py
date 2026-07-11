@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any, Optional
 
 from agent_trace._runtime import enter_agent, enter_step, enter_tool, exit_frame
+from agent_trace.context import get_context
 
 from ._stack import RunStack
 
@@ -48,6 +49,13 @@ class AgentTraceCallbackHandler(BaseCallbackHandler):
 
     ignore_llm = True
 
+    # langchain-core dispatches non-inline handlers via run_in_executor with a
+    # *copied* context, so ContextVar writes in enter_step/enter_agent never
+    # reach the task actually running the node. run_inline keeps dispatch on
+    # the calling task/thread so ambient context propagates correctly —
+    # required for correct nesting under async execution (ainvoke).
+    run_inline = True
+
     def __init__(
         self,
         agent_name: str = "LangChainAgent",
@@ -80,6 +88,12 @@ class AgentTraceCallbackHandler(BaseCallbackHandler):
             else:
                 exit_frame(frame)
 
+    def _resolve_parent_span(self, parent_run_id: Any) -> Any:
+        if parent_run_id is None:
+            return None
+        run_frame = self._stack.get(parent_run_id)
+        return run_frame.frame.span if run_frame is not None else None
+
     def on_chain_start(
         self,
         serialized: Optional[dict[str, Any]],
@@ -92,6 +106,15 @@ class AgentTraceCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> Any:
         if parent_run_id is None:
+            if get_context() is not None:
+                # An agent-trace context is already active (trace_graph()/
+                # agent_trace.agent() opened the agent span) — entering a
+                # second agent span here would duplicate it. Enter a step
+                # for the graph root instead.
+                step_name = _name_from_serialized(serialized, "graph")
+                frame = enter_step(step_name)
+                self._stack.push(run_id, frame, kind="step", parent_run_id=parent_run_id)
+                return
             frame = enter_agent(self.agent_name)
             self._stack.push(run_id, frame, kind="agent", parent_run_id=parent_run_id)
             return
@@ -100,7 +123,8 @@ class AgentTraceCallbackHandler(BaseCallbackHandler):
             step_name = str(metadata.get("langgraph_node") or metadata.get("step_name") or step_name)
         if step_name == "think":
             step_name = _name_from_serialized(serialized, "think")
-        frame = enter_step(step_name)
+        parent_span = self._resolve_parent_span(parent_run_id)
+        frame = enter_step(step_name, parent=parent_span)
         self._stack.push(run_id, frame, kind="step", parent_run_id=parent_run_id)
 
     def on_chain_end(self, outputs: dict[str, Any], *, run_id: Any, **kwargs: Any) -> Any:
@@ -121,7 +145,8 @@ class AgentTraceCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> Any:
         tool_name = _name_from_serialized(serialized, "tool")
-        frame = enter_tool(tool_name, input_value=input_str)
+        parent_span = self._resolve_parent_span(parent_run_id)
+        frame = enter_tool(tool_name, input_value=input_str, parent=parent_span)
         self._stack.push(run_id, frame, kind="tool", parent_run_id=parent_run_id)
 
     def on_tool_end(self, output: Any, *, run_id: Any, **kwargs: Any) -> Any:
@@ -133,7 +158,8 @@ class AgentTraceCallbackHandler(BaseCallbackHandler):
     def on_agent_action(self, action: Any, *, run_id: Any, **kwargs: Any) -> Any:
         if not self.step_on_agent_action:
             return
-        frame = enter_step("act")
+        parent_span = self._resolve_parent_span(run_id)
+        frame = enter_step("act", parent=parent_span)
         self._agent_action_frames[str(run_id)].append(frame)
 
     def on_agent_finish(self, finish: Any, *, run_id: Any, **kwargs: Any) -> Any:
